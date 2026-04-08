@@ -8,19 +8,16 @@ use noodles_sam::alignment::record::data::field::Tag;
 use noodles_util::alignment::io::Writer;
 use ontime::{parse_rfc3339_bytes, FastxRecordExt, ReadSelection};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
-use time::format_description::FormatItem;
-use time::macros::format_description;
 use time::Duration;
-use time::PrimitiveDateTime;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
-const SIDECAR_TIME_FMT: &[FormatItem<'_>] =
-    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
-const SIDECAR_MAGIC: &str = "# ontime-sidecar-v1";
+const SIDECAR_MAGIC: [u8; 8] = *b"ONTIDX2\0";
+const LEGACY_SIDECAR_PREFIX: [u8; 8] = *b"# ontime";
 
 /// A `Struct` used for seamlessly dealing with either compressed or uncompressed fasta/fastq files.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,35 +96,32 @@ fn read_sidecar(path: &Path) -> Result<Option<Vec<PrimitiveDateTime>>, IOError> 
     }
 
     let expected = file_fingerprint(path).map_err(|source| IOError::SidecarError { source })?;
-    let reader = BufReader::new(
+    let mut reader = BufReader::new(
         File::open(sidecar).map_err(|source| IOError::SidecarError { source })?,
     );
-    let mut lines = reader.lines();
 
-    let Some(Ok(magic)) = lines.next() else {
+    let mut magic = [0u8; SIDECAR_MAGIC.len()];
+    match reader.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(source) => return Err(IOError::SidecarError { source }),
+    }
+
+    if magic == LEGACY_SIDECAR_PREFIX {
         return Ok(None);
-    };
+    }
+
     if magic != SIDECAR_MAGIC {
         return Ok(None);
     }
 
-    let Some(Ok(size_line)) = lines.next() else {
+    let Some(size) = read_u64(&mut reader)? else {
         return Ok(None);
     };
-    let Some(size) = size_line.strip_prefix("size=") else {
+    let Some(mtime) = read_u128(&mut reader)? else {
         return Ok(None);
     };
-    let Ok(size) = size.parse::<u64>() else {
-        return Ok(None);
-    };
-
-    let Some(Ok(mtime_line)) = lines.next() else {
-        return Ok(None);
-    };
-    let Some(mtime) = mtime_line.strip_prefix("mtime_nanos=") else {
-        return Ok(None);
-    };
-    let Ok(mtime) = mtime.parse::<u128>() else {
+    let Some(count) = read_u64(&mut reader)? else {
         return Ok(None);
     };
 
@@ -135,13 +129,15 @@ fn read_sidecar(path: &Path) -> Result<Option<Vec<PrimitiveDateTime>>, IOError> 
         return Ok(None);
     }
 
-    let mut timestamps = Vec::new();
-    for line in lines {
-        let line = line.map_err(|source| IOError::SidecarError { source })?;
-        let Ok(timestamp) = PrimitiveDateTime::parse(&line, SIDECAR_TIME_FMT) else {
+    let mut timestamps = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some(timestamp_nanos) = read_i128(&mut reader)? else {
             return Ok(None);
         };
-        timestamps.push(timestamp);
+        let Ok(timestamp) = OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos) else {
+            return Ok(None);
+        };
+        timestamps.push(timestamp.date().with_time(timestamp.time()));
     }
 
     Ok(Some(timestamps))
@@ -154,19 +150,53 @@ fn write_sidecar(path: &Path, timestamps: &[PrimitiveDateTime]) -> Result<(), IO
     let file = File::create(sidecar).map_err(|source| IOError::SidecarError { source })?;
     let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "{SIDECAR_MAGIC}").map_err(|source| IOError::SidecarError { source })?;
-    writeln!(writer, "size={size}").map_err(|source| IOError::SidecarError { source })?;
-    writeln!(writer, "mtime_nanos={mtime_nanos}")
+    writer
+        .write_all(&SIDECAR_MAGIC)
+        .map_err(|source| IOError::SidecarError { source })?;
+    writer
+        .write_all(&size.to_le_bytes())
+        .map_err(|source| IOError::SidecarError { source })?;
+    writer
+        .write_all(&mtime_nanos.to_le_bytes())
+        .map_err(|source| IOError::SidecarError { source })?;
+    writer
+        .write_all(&(timestamps.len() as u64).to_le_bytes())
         .map_err(|source| IOError::SidecarError { source })?;
     for timestamp in timestamps {
-        let line = timestamp
-            .format(SIDECAR_TIME_FMT)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        let timestamp_nanos = timestamp.assume_utc().unix_timestamp_nanos();
+        writer
+            .write_all(&timestamp_nanos.to_le_bytes())
             .map_err(|source| IOError::SidecarError { source })?;
-        writeln!(writer, "{line}").map_err(|source| IOError::SidecarError { source })?;
     }
 
     Ok(())
+}
+
+fn read_u64<R: Read>(reader: &mut R) -> Result<Option<u64>, IOError> {
+    let mut buf = [0u8; std::mem::size_of::<u64>()];
+    match reader.read_exact(&mut buf) {
+        Ok(()) => Ok(Some(u64::from_le_bytes(buf))),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(source) => Err(IOError::SidecarError { source }),
+    }
+}
+
+fn read_u128<R: Read>(reader: &mut R) -> Result<Option<u128>, IOError> {
+    let mut buf = [0u8; std::mem::size_of::<u128>()];
+    match reader.read_exact(&mut buf) {
+        Ok(()) => Ok(Some(u128::from_le_bytes(buf))),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(source) => Err(IOError::SidecarError { source }),
+    }
+}
+
+fn read_i128<R: Read>(reader: &mut R) -> Result<Option<i128>, IOError> {
+    let mut buf = [0u8; std::mem::size_of::<i128>()];
+    match reader.read_exact(&mut buf) {
+        Ok(()) => Ok(Some(i128::from_le_bytes(buf))),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(source) => Err(IOError::SidecarError { source }),
+    }
 }
 
 pub fn alignment_start_times_from_path(path: &Path) -> Result<Vec<PrimitiveDateTime>, IOError> {
@@ -435,26 +465,29 @@ impl Fastx {
 
 pub trait TimeExt {
     fn start_times(&mut self) -> Result<Vec<PrimitiveDateTime>, IOError>;
-    fn extract_reads_relative_to_first_into(
+    fn extract_reads_relative_to_first_into<W: Write>(
         &mut self,
         from: Option<Duration>,
         to: Option<Duration>,
-        writer: &mut Writer,
+        writer: &mut Writer<W>,
     ) -> Result<(usize, usize), IOError>;
-    fn extract_reads_between_into(
+    fn extract_reads_between_into<W: Write>(
         &mut self,
         earliest: Option<&PrimitiveDateTime>,
         latest: Option<&PrimitiveDateTime>,
-        writer: &mut Writer,
+        writer: &mut Writer<W>,
     ) -> Result<(usize, usize), IOError>;
-    fn extract_reads_in_timeframe_into(
+    fn extract_reads_in_timeframe_into<W: Write>(
         &mut self,
         selection: &ReadSelection,
-        writer: &mut Writer,
+        writer: &mut Writer<W>,
     ) -> Result<(), IOError>;
 }
 
-impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
+impl<R> TimeExt for noodles_util::alignment::io::reader::Reader<R>
+where
+    R: Read,
+{
     fn start_times(&mut self) -> Result<Vec<PrimitiveDateTime>, IOError> {
         let mut start_times: Vec<PrimitiveDateTime> = vec![];
         let header = self
@@ -484,11 +517,11 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
         Ok(start_times)
     }
 
-    fn extract_reads_relative_to_first_into(
+    fn extract_reads_relative_to_first_into<W: Write>(
         &mut self,
         from: Option<Duration>,
         to: Option<Duration>,
-        writer: &mut Writer,
+        writer: &mut Writer<W>,
     ) -> Result<(usize, usize), IOError> {
         let header = self
             .read_header()
@@ -556,11 +589,11 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
         Ok((nb_reads_seen, nb_reads_written))
     }
 
-    fn extract_reads_between_into(
+    fn extract_reads_between_into<W: Write>(
         &mut self,
         earliest: Option<&PrimitiveDateTime>,
         latest: Option<&PrimitiveDateTime>,
-        writer: &mut Writer,
+        writer: &mut Writer<W>,
     ) -> Result<(usize, usize), IOError> {
         let header = self
             .read_header()
@@ -615,10 +648,10 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
         Ok((nb_reads_seen, nb_reads_written))
     }
 
-    fn extract_reads_in_timeframe_into(
+    fn extract_reads_in_timeframe_into<W: Write>(
         &mut self,
         selection: &ReadSelection,
-        writer: &mut Writer,
+        writer: &mut Writer<W>,
     ) -> Result<(), IOError> {
         let header = self
             .read_header()

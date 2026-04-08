@@ -12,8 +12,10 @@ use itertools::Itertools;
 use itertools::MinMaxResult::{MinMax, NoElements, OneElement};
 use log::info;
 use log::LevelFilter;
+use std::fs::File;
 use ontime::{valid_selection, DurationExt};
 use std::io::stdout;
+use std::path::Path;
 use time::format_description::well_known::Rfc3339;
 use time::format_description::FormatItem;
 use time::macros::format_description;
@@ -48,8 +50,64 @@ fn parse_relative_arg(value: &Option<String>) -> Result<Option<Duration>> {
         None => Ok(None),
         Some(s) => match PrimitiveDateTime::parse(s, &Rfc3339) {
             Ok(_) => Ok(None),
-            Err(_) => Ok(Some(Duration::from_str(s)?)),
+            Err(_) => Ok(Some(Duration::from_str(s).map_err(anyhow::Error::msg)?)),
         },
+    }
+}
+
+fn parse_duration_arg(s: &str) -> Result<Duration> {
+    Duration::from_str(s).map_err(anyhow::Error::msg)
+}
+
+fn alignment_output_builder_for_path(
+    path: &Path,
+) -> Result<noodles_util::alignment::io::writer::Builder> {
+    use noodles_util::alignment::io::{CompressionMethod, Format};
+
+    let compressed = matches!(path.extension().and_then(|ext| ext.to_str()), Some("gz" | "bgz"));
+
+    let uncompressed_path = if compressed {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    };
+
+    let ext = uncompressed_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .ok_or_else(|| anyhow!("Unrecognized file extension for alignment output"))?;
+
+    let format = match ext {
+        "sam" => Format::Sam,
+        "bam" => Format::Bam,
+        _ => return Err(anyhow!("Unrecognized file extension for alignment output")),
+    };
+
+    let compression_method = if compressed || matches!(format, Format::Bam) {
+        Some(CompressionMethod::Bgzf)
+    } else {
+        None
+    };
+
+    Ok(noodles_util::alignment::io::writer::Builder::default()
+        .set_format(format)
+        .set_compression_method(compression_method))
+}
+
+fn build_alignment_writer(
+    input_path: &Path,
+    output_path: Option<&Path>,
+) -> Result<noodles_util::alignment::io::Writer<Box<dyn std::io::Write>>> {
+    let target_path = output_path.unwrap_or(input_path);
+    let builder = alignment_output_builder_for_path(target_path)?;
+
+    match output_path {
+        Some(path) => builder
+            .build_from_writer(Box::new(File::create(path)?) as Box<dyn std::io::Write>)
+            .map_err(Into::into),
+        None => builder
+            .build_from_writer(Box::new(stdout()) as Box<dyn std::io::Write>)
+            .map_err(Into::into),
     }
 }
 
@@ -147,13 +205,7 @@ fn main() -> Result<()> {
                 nb_reads_written
             }
             FileFormat::Alignment => {
-                let mut writer = match &args.output {
-                    None => noodles_util::alignment::io::writer::Builder::default()
-                        .build_from_writer(Box::new(stdout()))?,
-                    Some(p) => {
-                        noodles_util::alignment::io::writer::Builder::default().build_from_path(p)?
-                    }
-                };
+                let mut writer = build_alignment_writer(&args.input, args.output.as_deref())?;
 
                 let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
                     .build_from_path(&args.input)?;
@@ -232,13 +284,7 @@ fn main() -> Result<()> {
                 nb_reads_written
             }
             FileFormat::Alignment => {
-                let mut writer = match &args.output {
-                    None => noodles_util::alignment::io::writer::Builder::default()
-                        .build_from_writer(Box::new(stdout()))?,
-                    Some(p) => {
-                        noodles_util::alignment::io::writer::Builder::default().build_from_path(p)?
-                    }
-                };
+                let mut writer = build_alignment_writer(&args.input, args.output.as_deref())?;
 
                 let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
                     .build_from_path(&args.input)?;
@@ -293,7 +339,7 @@ fn main() -> Result<()> {
         Some(s) => match PrimitiveDateTime::parse(&s, &Rfc3339) {
             Ok(t) => t,
             Err(_) => {
-                let duration = Duration::from_str(&s)?;
+                let duration = parse_duration_arg(&s)?;
                 if duration.is_negative() {
                     last_timestamp
                         .checked_add(duration)
@@ -312,7 +358,7 @@ fn main() -> Result<()> {
         Some(s) => match PrimitiveDateTime::parse(&s, &Rfc3339) {
             Ok(t) => t,
             Err(_) => {
-                let duration = Duration::from_str(&s)?;
+                let duration = parse_duration_arg(&s)?;
                 if duration.is_negative() {
                     last_timestamp
                         .checked_add(duration)
@@ -362,13 +408,7 @@ fn main() -> Result<()> {
             )?;
         }
         FileFormat::Alignment => {
-            let mut writer = match &args.output {
-                None => noodles_util::alignment::io::writer::Builder::default()
-                    .build_from_writer(Box::new(stdout()))?,
-                Some(p) => {
-                    noodles_util::alignment::io::writer::Builder::default().build_from_path(p)?
-                }
-            };
+            let mut writer = build_alignment_writer(&args.input, args.output.as_deref())?;
 
             let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
                 .build_from_path(&args.input)?;

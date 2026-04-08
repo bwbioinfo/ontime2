@@ -562,3 +562,32 @@ fn alignment_queries_create_and_reuse_timestamp_sidecar() -> Result<(), Box<dyn 
 
     Ok(())
 }
+
+#[test]
+fn legacy_text_sidecar_is_rebuilt_as_binary() -> Result<(), Box<dyn std::error::Error>> {
+    let tempdir = tempfile::tempdir()?;
+    let input = tempdir.path().join("legacy.sam");
+    fs::copy("tests/cases/test.sam", &input)?;
+
+    let mut sidecar = input.as_os_str().to_os_string();
+    sidecar.push(".ontime-index");
+    let sidecar_path = std::path::PathBuf::from(sidecar);
+
+    fs::write(
+        &sidecar_path,
+        concat!(
+            "# ontime-sidecar-v1\n",
+            "size=183732\n",
+            "mtime_nanos=0\n",
+            "2023-09-23T16:02:50.388Z\n"
+        ),
+    )?;
+
+    let mut cmd = Command::cargo_bin(BIN).unwrap();
+    cmd.args(["--show", input.to_str().unwrap()]).unwrap();
+
+    let sidecar_bytes = fs::read(&sidecar_path)?;
+    assert!(sidecar_bytes.starts_with(b"ONTIDX2\0"));
+
+    Ok(())
+}

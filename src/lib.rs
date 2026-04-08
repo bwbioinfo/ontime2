@@ -1,4 +1,3 @@
-use duration_str::DError;
 use needletail::parser::SequenceRecord;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, PrimitiveDateTime};
@@ -14,13 +13,13 @@ impl FastxRecordExt for SequenceRecord<'_> {
 }
 
 pub trait DurationExt {
-    fn from_str(s: &str) -> Result<Self, DError>
+    fn from_str(s: &str) -> Result<Self, String>
     where
         Self: Sized;
 }
 
 impl DurationExt for Duration {
-    fn from_str(s: &str) -> Result<Self, DError> {
+    fn from_str(s: &str) -> Result<Self, String> {
         if let Some(pos_s) = s.strip_prefix('-') {
             let dur = duration_str::parse_time(pos_s)?;
             Ok(-1 * dur)
