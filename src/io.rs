@@ -4,12 +4,11 @@ use needletail::errors::ParseErrorKind::EmptyFile;
 use needletail::parse_fastx_file;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_util::alignment::io::Writer;
-use ontime::FastxRecordExt;
+use ontime::{parse_rfc3339_bytes, FastxRecordExt, ReadSelection};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use time::format_description::well_known::Rfc3339;
 use time::PrimitiveDateTime;
 
 /// A `Struct` used for seamlessly dealing with either compressed or uncompressed fasta/fastq files.
@@ -136,19 +135,30 @@ impl Fastx {
 
     pub fn extract_reads_in_timeframe_into<T: Write>(
         &self,
-        reads_to_keep: &[bool],
-        nb_reads_keep: usize,
+        selection: &ReadSelection,
         write_to: &mut T,
     ) -> Result<(), IOError> {
         let mut reader =
             parse_fastx_file(&self.path).map_err(|source| IOError::ReadError { source })?;
         let mut read_idx: usize = 0;
         let mut nb_reads_written = 0;
+        let nb_reads_keep = selection.keep_count();
+        let mut next_sparse_idx = 0;
 
         while let Some(record) = reader.next() {
             match record {
                 Err(source) => return Err(IOError::ParseError { source }),
-                Ok(rec) if reads_to_keep[read_idx] => {
+                Ok(rec) if match selection {
+                    ReadSelection::Dense(mask) => mask[read_idx],
+                    ReadSelection::Sparse(indices) => {
+                        if next_sparse_idx < indices.len() && indices[next_sparse_idx] == read_idx {
+                            next_sparse_idx += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                } => {
                     rec.write(write_to, None)
                         .map_err(|err| IOError::WriteError {
                             source: anyhow::Error::from(err),
@@ -170,14 +180,56 @@ impl Fastx {
             Err(IOError::IndicesNotFound)
         }
     }
+
+    pub fn extract_reads_between_into<T: Write>(
+        &self,
+        earliest: Option<&PrimitiveDateTime>,
+        latest: Option<&PrimitiveDateTime>,
+        write_to: &mut T,
+    ) -> Result<(usize, usize), IOError> {
+        let mut reader =
+            parse_fastx_file(&self.path).map_err(|source| IOError::ReadError { source })?;
+        let mut nb_reads_seen = 0;
+        let mut nb_reads_written = 0;
+
+        while let Some(record) = reader.next() {
+            match record {
+                Err(source) => return Err(IOError::ParseError { source }),
+                Ok(rec) => {
+                    let start_time = rec
+                        .start_time()
+                        .ok_or(IOError::MissingTime(rec.start_line_number()))?;
+                    nb_reads_seen += 1;
+
+                    let keep = earliest.map_or(true, |min| &start_time >= min)
+                        && latest.map_or(true, |max| &start_time <= max);
+
+                    if keep {
+                        rec.write(write_to, None)
+                            .map_err(|err| IOError::WriteError {
+                                source: anyhow::Error::from(err),
+                            })?;
+                        nb_reads_written += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((nb_reads_seen, nb_reads_written))
+    }
 }
 
 pub trait TimeExt {
     fn start_times(&mut self) -> Result<Vec<PrimitiveDateTime>, IOError>;
+    fn extract_reads_between_into(
+        &mut self,
+        earliest: Option<&PrimitiveDateTime>,
+        latest: Option<&PrimitiveDateTime>,
+        writer: &mut Writer,
+    ) -> Result<(usize, usize), IOError>;
     fn extract_reads_in_timeframe_into(
         &mut self,
-        reads_to_keep: &[bool],
-        nb_reads_keep: usize,
+        selection: &ReadSelection,
         writer: &mut Writer,
     ) -> Result<(), IOError>;
 }
@@ -203,20 +255,77 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
                 .ok_or(IOError::MissingTime(i as u64))?
                 .map_err(|_| IOError::MissingTime(i as u64))?;
             let start_time = match start_time {
-                noodles_sam::alignment::record::data::field::Value::String(s) => s.to_string(),
+                noodles_sam::alignment::record::data::field::Value::String(s) => s,
                 _ => return Err(IOError::MissingTime(i as u64)),
             };
-            let start_time = PrimitiveDateTime::parse(&start_time, &Rfc3339)
-                .map_err(|_| IOError::MissingTime(i as u64))?;
+            let start_time = parse_rfc3339_bytes(start_time).ok_or(IOError::MissingTime(i as u64))?;
             start_times.push(start_time);
         }
         Ok(start_times)
     }
 
+    fn extract_reads_between_into(
+        &mut self,
+        earliest: Option<&PrimitiveDateTime>,
+        latest: Option<&PrimitiveDateTime>,
+        writer: &mut Writer,
+    ) -> Result<(usize, usize), IOError> {
+        let header = self
+            .read_header()
+            .map_err(|source| IOError::ReadHeaderError {
+                source: anyhow::Error::from(source),
+            })?;
+        let records = self.records(&header);
+        let tag = Tag::new(b's', b't');
+        let mut nb_reads_seen = 0;
+        let mut nb_reads_written = 0;
+
+        writer
+            .write_header(&header)
+            .map_err(|source| IOError::WriteError {
+                source: anyhow::Error::from(source),
+            })?;
+
+        for (i, record) in records.enumerate() {
+            let record = record.map_err(|source| IOError::ParseAlignmentError {
+                source: anyhow! { source.to_string() },
+            })?;
+            let data = record.data();
+            let start_time = data
+                .get(&tag)
+                .ok_or(IOError::MissingTime(i as u64))?
+                .map_err(|_| IOError::MissingTime(i as u64))?;
+            let start_time = match start_time {
+                noodles_sam::alignment::record::data::field::Value::String(s) => s,
+                _ => return Err(IOError::MissingTime(i as u64)),
+            };
+            let start_time =
+                parse_rfc3339_bytes(start_time).ok_or(IOError::MissingTime(i as u64))?;
+            nb_reads_seen += 1;
+
+            let keep = earliest.map_or(true, |min| &start_time >= min)
+                && latest.map_or(true, |max| &start_time <= max);
+
+            if keep {
+                writer
+                    .write_record(&header, &record)
+                    .map_err(|source| IOError::WriteError {
+                        source: anyhow::Error::from(source),
+                    })?;
+                nb_reads_written += 1;
+            }
+        }
+
+        writer.finish(&header).map_err(|source| IOError::WriteError {
+            source: anyhow::Error::from(source),
+        })?;
+
+        Ok((nb_reads_seen, nb_reads_written))
+    }
+
     fn extract_reads_in_timeframe_into(
         &mut self,
-        reads_to_keep: &[bool],
-        nb_reads_keep: usize,
+        selection: &ReadSelection,
         writer: &mut Writer,
     ) -> Result<(), IOError> {
         let header = self
@@ -226,12 +335,31 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
             })?;
         let records = self.records(&header);
         let mut nb_reads_written = 0;
+        let nb_reads_keep = selection.keep_count();
+        let mut next_sparse_idx = 0;
+
+        writer
+            .write_header(&header)
+            .map_err(|source| IOError::WriteError {
+                source: anyhow::Error::from(source),
+            })?;
 
         for (i, record) in records.enumerate() {
             let record = record.map_err(|source| IOError::ParseAlignmentError {
                 source: anyhow! { source.to_string() },
             })?;
-            if reads_to_keep[i] {
+            let keep = match selection {
+                ReadSelection::Dense(mask) => mask[i],
+                ReadSelection::Sparse(indices) => {
+                    if next_sparse_idx < indices.len() && indices[next_sparse_idx] == i {
+                        next_sparse_idx += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if keep {
                 writer
                     .write_record(&header, &record)
                     .map_err(|source| IOError::WriteError {
@@ -240,6 +368,11 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
                 nb_reads_written += 1;
             }
         }
+
+        writer.finish(&header).map_err(|source| IOError::WriteError {
+            source: anyhow::Error::from(source),
+        })?;
+
         if nb_reads_written == nb_reads_keep {
             Ok(())
         } else {

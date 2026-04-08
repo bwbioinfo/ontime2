@@ -11,7 +11,7 @@ use itertools::Itertools;
 use itertools::MinMaxResult::{MinMax, NoElements, OneElement};
 use log::info;
 use log::LevelFilter;
-use ontime::{valid_indices, DurationExt};
+use ontime::{valid_selection, DurationExt};
 use std::io::stdout;
 use time::format_description::well_known::Rfc3339;
 use time::format_description::FormatItem;
@@ -25,6 +25,21 @@ const TIME_FMT: &[FormatItem<'_>] =
 enum FileFormat {
     Alignment,
     Fastx,
+}
+
+enum TimeArg {
+    Absent,
+    Timestamp(PrimitiveDateTime),
+    Relative,
+}
+
+fn classify_time_arg(value: &Option<String>) -> TimeArg {
+    match value {
+        None => TimeArg::Absent,
+        Some(s) => PrimitiveDateTime::parse(s, &Rfc3339)
+            .map(TimeArg::Timestamp)
+            .unwrap_or(TimeArg::Relative),
+    }
 }
 
 fn main() -> Result<()> {
@@ -74,6 +89,91 @@ fn main() -> Result<()> {
     }
 
     let input_fastx = Fastx::from_path(&args.input);
+
+    let absolute_earliest = classify_time_arg(&args.earliest);
+    let absolute_latest = classify_time_arg(&args.latest);
+
+    if !args.show
+        && !matches!(absolute_earliest, TimeArg::Relative)
+        && !matches!(absolute_latest, TimeArg::Relative)
+        && (matches!(absolute_earliest, TimeArg::Timestamp(_))
+            || matches!(absolute_latest, TimeArg::Timestamp(_)))
+    {
+        let earliest = match absolute_earliest {
+            TimeArg::Timestamp(ts) => Some(ts),
+            TimeArg::Absent => None,
+            TimeArg::Relative => unreachable!(),
+        };
+        let latest = match absolute_latest {
+            TimeArg::Timestamp(ts) => Some(ts),
+            TimeArg::Absent => None,
+            TimeArg::Relative => unreachable!(),
+        };
+
+        if let (Some(earliest), Some(latest)) = (earliest, latest) {
+            if latest < earliest {
+                return Err(anyhow!(
+                    "The earliest timestamp is after the latest timestamp"
+                ));
+            }
+        }
+
+        info!("Using single-pass extraction for absolute timestamp bounds");
+        info!(
+            "Extracting reads with a start time between {:?} and {:?}...",
+            earliest, latest
+        );
+
+        let nb_reads_to_keep = match output_type {
+            FileFormat::Fastx => {
+                let mut output_handle = match &args.output {
+                    None => match args.output_type {
+                        None => Box::new(stdout()),
+                        Some(fmt) => {
+                            niffler::basic::get_writer(Box::new(stdout()), fmt, args.compress_level)?
+                        }
+                    },
+                    Some(p) => {
+                        let out_fastx = Fastx::from_path(p);
+                        out_fastx
+                            .create(args.compress_level, args.output_type)
+                            .context("Failed to create the output file")?
+                    }
+                };
+
+                let (nb_reads_seen, nb_reads_written) = input_fastx
+                    .extract_reads_between_into(earliest.as_ref(), latest.as_ref(), &mut output_handle)
+                    .context("Failed to extract start times")?;
+                if nb_reads_seen == 0 {
+                    return Err(anyhow!("Did not find any start times in the input"));
+                }
+                nb_reads_written
+            }
+            FileFormat::Alignment => {
+                let mut writer = match &args.output {
+                    None => noodles_util::alignment::io::writer::Builder::default()
+                        .build_from_writer(Box::new(stdout()))?,
+                    Some(p) => {
+                        noodles_util::alignment::io::writer::Builder::default().build_from_path(p)?
+                    }
+                };
+
+                let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
+                    .build_from_path(&args.input)?;
+                let (nb_reads_seen, nb_reads_written) = bam_reader
+                    .extract_reads_between_into(earliest.as_ref(), latest.as_ref(), &mut writer)
+                    .context("Failed to extract start times")?;
+                if nb_reads_seen == 0 {
+                    return Err(anyhow!("Did not find any start times in the input"));
+                }
+                nb_reads_written
+            }
+        };
+
+        info!("Done! Kept {} reads", nb_reads_to_keep);
+        return Ok(());
+    }
+
     let mut bam_reader =
         noodles_util::alignment::io::reader::Builder::default().build_from_path(&args.input)?;
 
@@ -157,7 +257,8 @@ fn main() -> Result<()> {
         "Extracting reads with a start time between {} and {}...",
         earliest, latest
     );
-    let (reads_to_keep, nb_reads_to_keep) = valid_indices(&start_times, &earliest, &latest);
+    let reads_to_keep = valid_selection(&start_times, &earliest, &latest);
+    let nb_reads_to_keep = reads_to_keep.keep_count();
 
     match output_type {
         FileFormat::Fastx => {
@@ -178,7 +279,6 @@ fn main() -> Result<()> {
 
             input_fastx.extract_reads_in_timeframe_into(
                 &reads_to_keep,
-                nb_reads_to_keep,
                 &mut output_handle,
             )?;
         }
@@ -193,17 +293,10 @@ fn main() -> Result<()> {
 
             let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
                 .build_from_path(&args.input)?;
-            let header = bam_reader.read_header()?;
-            writer.write_header(&header)?;
-            // need to reopen the bam reader as the header has been read and we need to read it again
-            let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
-                .build_from_path(&args.input)?;
             bam_reader.extract_reads_in_timeframe_into(
                 &reads_to_keep,
-                nb_reads_to_keep,
                 &mut writer,
             )?;
-            writer.finish(&header)?;
         }
     };
 

@@ -455,3 +455,31 @@ fn sam_input() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn sam_input_with_absolute_timestamps() -> Result<(), Box<dyn std::error::Error>> {
+    let input = "tests/cases/test.sam";
+    let mut cmd = Command::cargo_bin(BIN).unwrap();
+    let output = cmd
+        .args([
+            "-f",
+            "2023-09-22T20:54:22.039Z",
+            "-t",
+            "2023-09-22T20:54:22.039Z",
+            input,
+        ])
+        .unwrap()
+        .stdout;
+
+    let mut actual_n_records = 0;
+    for line in output.lines() {
+        if line.starts_with(b"@") {
+            continue;
+        }
+        actual_n_records += 1;
+    }
+
+    assert_eq!(actual_n_records, 1);
+
+    Ok(())
+}

@@ -1,14 +1,7 @@
-use bstr::ByteSlice;
 use duration_str::DError;
-use lazy_static::lazy_static;
 use needletail::parser::SequenceRecord;
-use regex::bytes::Regex;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, PrimitiveDateTime};
-
-lazy_static! {
-    pub static ref DATETIME_RE: Regex = Regex::new(r"(start_time=|st:Z:)(?P<time>\S+)\s*").unwrap();
-}
 
 pub trait FastxRecordExt {
     fn start_time(&self) -> Option<PrimitiveDateTime>;
@@ -16,10 +9,7 @@ pub trait FastxRecordExt {
 
 impl FastxRecordExt for SequenceRecord<'_> {
     fn start_time(&self) -> Option<PrimitiveDateTime> {
-        let caps = DATETIME_RE.captures(self.id())?;
-        let m = caps.name("time")?;
-        let datetime = m.as_bytes().to_str_lossy();
-        PrimitiveDateTime::parse(&datetime, &Rfc3339).ok()
+        extract_embedded_timestamp(self.id())
     }
 }
 
@@ -40,21 +30,65 @@ impl DurationExt for Duration {
     }
 }
 
-pub fn valid_indices(
+pub enum ReadSelection {
+    Dense(Vec<bool>),
+    Sparse(Vec<usize>),
+}
+
+impl ReadSelection {
+    pub fn keep_count(&self) -> usize {
+        match self {
+            Self::Dense(mask) => mask.iter().filter(|keep| **keep).count(),
+            Self::Sparse(indices) => indices.len(),
+        }
+    }
+}
+
+pub fn parse_rfc3339_bytes(bytes: &[u8]) -> Option<PrimitiveDateTime> {
+    let timestamp = std::str::from_utf8(bytes).ok()?;
+    PrimitiveDateTime::parse(timestamp, &Rfc3339).ok()
+}
+
+pub fn extract_embedded_timestamp(bytes: &[u8]) -> Option<PrimitiveDateTime> {
+    const FASTQ_PREFIX: &[u8] = b"start_time=";
+    const BAM_PREFIX: &[u8] = b"st:Z:";
+
+    let start = find_subslice(bytes, FASTQ_PREFIX)
+        .map(|idx| idx + FASTQ_PREFIX.len())
+        .or_else(|| find_subslice(bytes, BAM_PREFIX).map(|idx| idx + BAM_PREFIX.len()))?;
+
+    let end = bytes[start..]
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .map_or(bytes.len(), |offset| start + offset);
+
+    parse_rfc3339_bytes(&bytes[start..end])
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+pub fn valid_selection(
     timestamps: &[PrimitiveDateTime],
     earliest: &PrimitiveDateTime,
     latest: &PrimitiveDateTime,
-) -> (Vec<bool>, usize) {
-    let mut to_keep: Vec<bool> = vec![false; timestamps.len()];
-    let mut nb_reads_to_keep = 0;
-    timestamps.iter().enumerate().for_each(|(i, t)| {
-        if earliest <= t && t <= latest {
-            to_keep[i] = true;
-            nb_reads_to_keep += 1;
-        }
-    });
+) -> ReadSelection {
+    let selected_indices: Vec<usize> = timestamps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| (earliest <= t && t <= latest).then_some(i))
+        .collect();
 
-    (to_keep, nb_reads_to_keep)
+    if selected_indices.len() * std::mem::size_of::<usize>() < timestamps.len() {
+        ReadSelection::Sparse(selected_indices)
+    } else {
+        let mut to_keep: Vec<bool> = vec![false; timestamps.len()];
+        for idx in selected_indices {
+            to_keep[idx] = true;
+        }
+        ReadSelection::Dense(to_keep)
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +241,52 @@ mod tests {
         let s = "11h30min12foo";
         let actual = Duration::from_str(s);
         assert!(actual.is_err())
+    }
+
+    #[test]
+    fn test_valid_selection_prefers_sparse_for_sparse_windows() {
+        let timestamps = vec![
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(12:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(13:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(14:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(15:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(16:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(17:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(18:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(19:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(20:00:00)),
+        ];
+
+        let selection = valid_selection(
+            &timestamps,
+            &PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(12:00:00)),
+            &PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(12:00:00)),
+        );
+
+        match selection {
+            ReadSelection::Sparse(indices) => assert_eq!(indices, vec![0]),
+            ReadSelection::Dense(_) => panic!("expected sparse selection"),
+        }
+    }
+
+    #[test]
+    fn test_valid_selection_prefers_dense_for_dense_windows() {
+        let timestamps = vec![
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(12:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(13:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(14:00:00)),
+            PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(15:00:00)),
+        ];
+
+        let selection = valid_selection(
+            &timestamps,
+            &PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(12:00:00)),
+            &PrimitiveDateTime::new(date!(2022 - 12 - 12), time!(15:00:00)),
+        );
+
+        match selection {
+            ReadSelection::Dense(mask) => assert_eq!(mask, vec![true, true, true, true]),
+            ReadSelection::Sparse(_) => panic!("expected dense selection"),
+        }
     }
 }
