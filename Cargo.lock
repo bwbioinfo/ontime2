@@ -415,6 +415,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -778,7 +779,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "indexmap",
- "noodles-bgzf",
+ "noodles-bgzf 0.26.0",
  "noodles-core",
  "noodles-csi",
  "noodles-sam",
@@ -791,6 +792,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8970db2e84adb1007377dd3988258d7a64e3fc4c05602ebf94e1f8cba207c030"
 dependencies = [
  "byteorder",
+ "bytes",
+ "crossbeam-channel",
+ "flate2",
+]
+
+[[package]]
+name = "noodles-bgzf"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37290f565045fd2775b549e62dffca7e1afadc70d8d5a3a2ef19609eb3d8193b"
+dependencies = [
  "bytes",
  "crossbeam-channel",
  "flate2",
@@ -832,7 +844,7 @@ dependencies = [
  "bit-vec",
  "byteorder",
  "indexmap",
- "noodles-bgzf",
+ "noodles-bgzf 0.26.0",
  "noodles-core",
 ]
 
@@ -844,7 +856,7 @@ checksum = "ebb3e83e0f112d3482f5234a1eb219081f12cc3aab38a9eba00ef1846b43b63b"
 dependencies = [
  "bytes",
  "memchr",
- "noodles-bgzf",
+ "noodles-bgzf 0.26.0",
  "noodles-core",
 ]
 
@@ -859,7 +871,7 @@ dependencies = [
  "indexmap",
  "lexical-core",
  "memchr",
- "noodles-bgzf",
+ "noodles-bgzf 0.26.0",
  "noodles-core",
  "noodles-csi",
 ]
@@ -872,7 +884,7 @@ checksum = "e5a69c78186ac9ff49dead1cba33eea5bae32cc0bb2d1250e96db355c3cba1cd"
 dependencies = [
  "flate2",
  "noodles-bam",
- "noodles-bgzf",
+ "noodles-bgzf 0.26.0",
  "noodles-core",
  "noodles-cram",
  "noodles-csi",
@@ -923,6 +935,8 @@ dependencies = [
  "log",
  "needletail",
  "niffler",
+ "noodles-bam",
+ "noodles-bgzf 0.46.0",
  "noodles-sam",
  "noodles-util",
  "regex",
@@ -1540,6 +1554,12 @@ checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
 dependencies = [
  "lzma-sys",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
 
 [[package]]
 name = "zmij"

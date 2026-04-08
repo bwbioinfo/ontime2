@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use bstr::ByteSlice;
 use indoc::indoc;
+use std::fs;
 use std::io::Write;
 
 const BIN: &str = "ontime";
@@ -193,6 +194,50 @@ fn timeframe_includes_only_latest() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected = indoc! {b"@s0 start_time=2022-12-12T18:00:00Z
     A
+    +
+    1
+    "};
+
+    assert_eq!(output, expected);
+
+    Ok(())
+}
+
+#[test]
+fn sorted_relative_first_hour_uses_first_record_as_anchor() -> Result<(), Box<dyn std::error::Error>>
+{
+    let text = indoc! {b"@s0 start_time=2022-12-12T12:00:00Z
+    A
+    +
+    1
+    @s1 start_time=2022-12-12T12:30:00Z
+    C
+    +
+    1
+    @s2 start_time=2022-12-12T13:30:00Z
+    G
+    +
+    1
+    "};
+    let mut file = tempfile::Builder::new().suffix(".fq").tempfile().unwrap();
+    file.write_all(text).unwrap();
+    let mut cmd = Command::cargo_bin(BIN).unwrap();
+    let output = cmd
+        .args([
+            "--assume-start-time-sorted",
+            "-t",
+            "1h",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap()
+        .stdout;
+
+    let expected = indoc! {b"@s0 start_time=2022-12-12T12:00:00Z
+    A
+    +
+    1
+    @s1 start_time=2022-12-12T12:30:00Z
+    C
     +
     1
     "};
@@ -480,6 +525,40 @@ fn sam_input_with_absolute_timestamps() -> Result<(), Box<dyn std::error::Error>
     }
 
     assert_eq!(actual_n_records, 1);
+
+    Ok(())
+}
+
+#[test]
+fn alignment_queries_create_and_reuse_timestamp_sidecar() -> Result<(), Box<dyn std::error::Error>>
+{
+    let tempdir = tempfile::tempdir()?;
+    let input = tempdir.path().join("cached.sam");
+    fs::copy("tests/cases/test.sam", &input)?;
+    let mut sidecar = input.as_os_str().to_os_string();
+    sidecar.push(".ontime-index");
+
+    let mut show_cmd = Command::cargo_bin(BIN).unwrap();
+    show_cmd.args(["--show", input.to_str().unwrap()]).unwrap();
+
+    let sidecar_path = std::path::PathBuf::from(sidecar);
+    assert!(sidecar_path.exists());
+
+    let mut query_cmd = Command::cargo_bin(BIN).unwrap();
+    let output = query_cmd
+        .args(["-t", "-4h", input.to_str().unwrap()])
+        .unwrap()
+        .stdout;
+
+    let mut actual_n_records = 0;
+    for line in output.lines() {
+        if line.starts_with(b"@") {
+            continue;
+        }
+        actual_n_records += 1;
+    }
+
+    assert_eq!(actual_n_records, 8);
 
     Ok(())
 }

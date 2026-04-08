@@ -2,14 +2,25 @@ use crate::cli::CompressionExt;
 use anyhow::anyhow;
 use needletail::errors::ParseErrorKind::EmptyFile;
 use needletail::parse_fastx_file;
+use noodles_bam as bam;
+use noodles_bgzf as bgzf;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_util::alignment::io::Writer;
 use ontime::{parse_rfc3339_bytes, FastxRecordExt, ReadSelection};
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use thiserror::Error;
+use time::format_description::FormatItem;
+use time::macros::format_description;
+use time::Duration;
 use time::PrimitiveDateTime;
+
+const SIDECAR_TIME_FMT: &[FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
+const SIDECAR_MAGIC: &str = "# ontime-sidecar-v1";
 
 /// A `Struct` used for seamlessly dealing with either compressed or uncompressed fasta/fastq files.
 #[derive(Debug, PartialEq, Eq)]
@@ -60,6 +71,159 @@ pub enum IOError {
     /// Indicates that the alignment file record could not be parsed.
     #[error("Failed to parse alignment record")]
     ParseAlignmentError { source: anyhow::Error },
+
+    /// Indicates an issue reading or writing the timestamp sidecar.
+    #[error("Failed to access timestamp sidecar")]
+    SidecarError { source: std::io::Error },
+}
+
+fn sidecar_path(path: &Path) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".ontime-index");
+    PathBuf::from(sidecar)
+}
+
+fn file_fingerprint(path: &Path) -> std::io::Result<(u64, u128)> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    Ok((metadata.len(), modified.as_nanos()))
+}
+
+fn read_sidecar(path: &Path) -> Result<Option<Vec<PrimitiveDateTime>>, IOError> {
+    let sidecar = sidecar_path(path);
+    if !sidecar.exists() {
+        return Ok(None);
+    }
+
+    let expected = file_fingerprint(path).map_err(|source| IOError::SidecarError { source })?;
+    let reader = BufReader::new(
+        File::open(sidecar).map_err(|source| IOError::SidecarError { source })?,
+    );
+    let mut lines = reader.lines();
+
+    let Some(Ok(magic)) = lines.next() else {
+        return Ok(None);
+    };
+    if magic != SIDECAR_MAGIC {
+        return Ok(None);
+    }
+
+    let Some(Ok(size_line)) = lines.next() else {
+        return Ok(None);
+    };
+    let Some(size) = size_line.strip_prefix("size=") else {
+        return Ok(None);
+    };
+    let Ok(size) = size.parse::<u64>() else {
+        return Ok(None);
+    };
+
+    let Some(Ok(mtime_line)) = lines.next() else {
+        return Ok(None);
+    };
+    let Some(mtime) = mtime_line.strip_prefix("mtime_nanos=") else {
+        return Ok(None);
+    };
+    let Ok(mtime) = mtime.parse::<u128>() else {
+        return Ok(None);
+    };
+
+    if (size, mtime) != expected {
+        return Ok(None);
+    }
+
+    let mut timestamps = Vec::new();
+    for line in lines {
+        let line = line.map_err(|source| IOError::SidecarError { source })?;
+        let Ok(timestamp) = PrimitiveDateTime::parse(&line, SIDECAR_TIME_FMT) else {
+            return Ok(None);
+        };
+        timestamps.push(timestamp);
+    }
+
+    Ok(Some(timestamps))
+}
+
+fn write_sidecar(path: &Path, timestamps: &[PrimitiveDateTime]) -> Result<(), IOError> {
+    let sidecar = sidecar_path(path);
+    let (size, mtime_nanos) =
+        file_fingerprint(path).map_err(|source| IOError::SidecarError { source })?;
+    let file = File::create(sidecar).map_err(|source| IOError::SidecarError { source })?;
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "{SIDECAR_MAGIC}").map_err(|source| IOError::SidecarError { source })?;
+    writeln!(writer, "size={size}").map_err(|source| IOError::SidecarError { source })?;
+    writeln!(writer, "mtime_nanos={mtime_nanos}")
+        .map_err(|source| IOError::SidecarError { source })?;
+    for timestamp in timestamps {
+        let line = timestamp
+            .format(SIDECAR_TIME_FMT)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+            .map_err(|source| IOError::SidecarError { source })?;
+        writeln!(writer, "{line}").map_err(|source| IOError::SidecarError { source })?;
+    }
+
+    Ok(())
+}
+
+pub fn alignment_start_times_from_path(path: &Path) -> Result<Vec<PrimitiveDateTime>, IOError> {
+    if let Some(timestamps) = read_sidecar(path)? {
+        return Ok(timestamps);
+    }
+
+    let timestamps = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("bam") => bam_start_times_from_path_parallel(path)?,
+        _ => {
+            let mut reader = noodles_util::alignment::io::reader::Builder::default()
+                .build_from_path(path)
+                .map_err(|source| IOError::ReadHeaderError {
+                    source: anyhow::Error::from(source),
+                })?;
+            reader.start_times()?
+        }
+    };
+    let _ = write_sidecar(path, &timestamps);
+    Ok(timestamps)
+}
+
+fn bam_start_times_from_path_parallel(path: &Path) -> Result<Vec<PrimitiveDateTime>, IOError> {
+    let worker_count = std::thread::available_parallelism()
+        .ok()
+        .unwrap_or_else(|| NonZeroUsize::new(1).unwrap());
+    let file = File::open(path).map_err(|source| IOError::CreateError { source })?;
+    let bgzf_reader = bgzf::io::MultithreadedReader::with_worker_count(worker_count, file);
+    let mut reader = bam::io::Reader::from(bgzf_reader);
+    reader
+        .read_header()
+        .map_err(|source| IOError::ReadHeaderError {
+            source: anyhow::Error::from(source),
+        })?;
+
+    let tag = Tag::new(b's', b't');
+    let mut start_times = Vec::new();
+
+    for (i, record) in reader.records().enumerate() {
+        let record = record.map_err(|source| IOError::ParseAlignmentError {
+            source: anyhow! { source.to_string() },
+        })?;
+        let data = record.data();
+        let start_time = data
+            .get(&tag)
+            .ok_or(IOError::MissingTime(i as u64))?
+            .map_err(|_| IOError::MissingTime(i as u64))?;
+        let start_time = match start_time {
+            noodles_sam::alignment::record::data::field::Value::String(s) => s,
+            _ => return Err(IOError::MissingTime(i as u64)),
+        };
+        let start_time =
+            parse_rfc3339_bytes(start_time).ok_or(IOError::MissingTime(i as u64))?;
+        start_times.push(start_time);
+    }
+
+    Ok(start_times)
 }
 
 impl Fastx {
@@ -217,10 +381,66 @@ impl Fastx {
 
         Ok((nb_reads_seen, nb_reads_written))
     }
+
+    pub fn extract_reads_relative_to_first_into<T: Write>(
+        &self,
+        from: Option<Duration>,
+        to: Option<Duration>,
+        write_to: &mut T,
+    ) -> Result<(usize, usize), IOError> {
+        let mut reader =
+            parse_fastx_file(&self.path).map_err(|source| IOError::ReadError { source })?;
+        let mut nb_reads_seen = 0;
+        let mut nb_reads_written = 0;
+        let mut anchor: Option<PrimitiveDateTime> = None;
+        let mut earliest_bound = None;
+        let mut latest_bound = None;
+
+        while let Some(record) = reader.next() {
+            match record {
+                Err(source) => return Err(IOError::ParseError { source }),
+                Ok(rec) => {
+                    let start_time = rec
+                        .start_time()
+                        .ok_or(IOError::MissingTime(rec.start_line_number()))?;
+                    nb_reads_seen += 1;
+
+                    if anchor.is_none() {
+                        anchor = Some(start_time);
+                        earliest_bound = from.and_then(|dur| start_time.checked_add(dur));
+                        latest_bound = to.and_then(|dur| start_time.checked_add(dur));
+                    }
+
+                    if latest_bound.map_or(false, |max| start_time > max) {
+                        break;
+                    }
+
+                    let keep = earliest_bound.map_or(true, |min| start_time >= min)
+                        && latest_bound.map_or(true, |max| start_time <= max);
+
+                    if keep {
+                        rec.write(write_to, None)
+                            .map_err(|err| IOError::WriteError {
+                                source: anyhow::Error::from(err),
+                            })?;
+                        nb_reads_written += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((nb_reads_seen, nb_reads_written))
+    }
 }
 
 pub trait TimeExt {
     fn start_times(&mut self) -> Result<Vec<PrimitiveDateTime>, IOError>;
+    fn extract_reads_relative_to_first_into(
+        &mut self,
+        from: Option<Duration>,
+        to: Option<Duration>,
+        writer: &mut Writer,
+    ) -> Result<(usize, usize), IOError>;
     fn extract_reads_between_into(
         &mut self,
         earliest: Option<&PrimitiveDateTime>,
@@ -262,6 +482,78 @@ impl TimeExt for noodles_util::alignment::io::reader::Reader<Box<dyn BufRead>> {
             start_times.push(start_time);
         }
         Ok(start_times)
+    }
+
+    fn extract_reads_relative_to_first_into(
+        &mut self,
+        from: Option<Duration>,
+        to: Option<Duration>,
+        writer: &mut Writer,
+    ) -> Result<(usize, usize), IOError> {
+        let header = self
+            .read_header()
+            .map_err(|source| IOError::ReadHeaderError {
+                source: anyhow::Error::from(source),
+            })?;
+        let records = self.records(&header);
+        let tag = Tag::new(b's', b't');
+        let mut nb_reads_seen = 0;
+        let mut nb_reads_written = 0;
+        let mut anchor: Option<PrimitiveDateTime> = None;
+        let mut earliest_bound = None;
+        let mut latest_bound = None;
+
+        writer
+            .write_header(&header)
+            .map_err(|source| IOError::WriteError {
+                source: anyhow::Error::from(source),
+            })?;
+
+        for (i, record) in records.enumerate() {
+            let record = record.map_err(|source| IOError::ParseAlignmentError {
+                source: anyhow! { source.to_string() },
+            })?;
+            let data = record.data();
+            let start_time = data
+                .get(&tag)
+                .ok_or(IOError::MissingTime(i as u64))?
+                .map_err(|_| IOError::MissingTime(i as u64))?;
+            let start_time = match start_time {
+                noodles_sam::alignment::record::data::field::Value::String(s) => s,
+                _ => return Err(IOError::MissingTime(i as u64)),
+            };
+            let start_time =
+                parse_rfc3339_bytes(start_time).ok_or(IOError::MissingTime(i as u64))?;
+            nb_reads_seen += 1;
+
+            if anchor.is_none() {
+                anchor = Some(start_time);
+                earliest_bound = from.and_then(|dur| start_time.checked_add(dur));
+                latest_bound = to.and_then(|dur| start_time.checked_add(dur));
+            }
+
+            if latest_bound.map_or(false, |max| start_time > max) {
+                break;
+            }
+
+            let keep = earliest_bound.map_or(true, |min| start_time >= min)
+                && latest_bound.map_or(true, |max| start_time <= max);
+
+            if keep {
+                writer
+                    .write_record(&header, &record)
+                    .map_err(|source| IOError::WriteError {
+                        source: anyhow::Error::from(source),
+                    })?;
+                nb_reads_written += 1;
+            }
+        }
+
+        writer.finish(&header).map_err(|source| IOError::WriteError {
+            source: anyhow::Error::from(source),
+        })?;
+
+        Ok((nb_reads_seen, nb_reads_written))
     }
 
     fn extract_reads_between_into(

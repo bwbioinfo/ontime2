@@ -54,6 +54,13 @@ pub struct Cli {
     /// Show the earliest and latest start times in the input and exit
     #[clap(short, long)]
     pub show: bool,
+    /// Assume records are sorted by ascending start_time
+    ///
+    /// This enables single-pass relative-duration filtering, e.g. "first 1h", by treating the
+    /// first timestamped record as the start of the run. Only use this when input ordering is
+    /// known to match start_time order.
+    #[clap(long)]
+    pub assume_start_time_sorted: bool,
 }
 
 /// A collection of custom errors relating to the command line interface for this package.
