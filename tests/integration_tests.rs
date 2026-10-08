@@ -3,8 +3,34 @@ use bstr::ByteSlice;
 use indoc::indoc;
 use std::fs;
 use std::io::Write;
+use std::process::Command as ProcessCommand;
 
 const BIN: &str = "ontime";
+
+fn make_bam_from_sam(
+    tempdir: &tempfile::TempDir,
+    source_sam: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let input = tempdir.path().join("input.sam");
+    let output = tempdir.path().join("input.bam");
+    fs::copy(source_sam, &input)?;
+
+    let status = ProcessCommand::new("samtools")
+        .args([
+            "view",
+            "-bS",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("samtools view failed with status {status}").into());
+    }
+
+    Ok(output)
+}
 
 #[test]
 fn input_file_does_not_exist() -> Result<(), Box<dyn std::error::Error>> {
@@ -564,6 +590,50 @@ fn alignment_queries_create_and_reuse_timestamp_sidecar() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn bam_input_uses_sidecar_and_repeat_query_path() -> Result<(), Box<dyn std::error::Error>> {
+    let tempdir = tempfile::tempdir()?;
+    let input = make_bam_from_sam(&tempdir, "tests/cases/test.sam")?;
+    let mut sidecar = input.as_os_str().to_os_string();
+    sidecar.push(".ontime-index");
+    let sidecar_path = std::path::PathBuf::from(sidecar);
+
+    let mut show_cmd = Command::cargo_bin(BIN).unwrap();
+    show_cmd.args(["--show", input.to_str().unwrap()]).unwrap();
+    assert!(sidecar_path.exists());
+
+    let mut query_cmd = Command::cargo_bin(BIN).unwrap();
+    let output = query_cmd
+        .args(["-t", "-4h", input.to_str().unwrap()])
+        .unwrap()
+        .stdout;
+
+    let mut samtools = ProcessCommand::new("samtools");
+    let decoded = samtools
+        .args(["view", "-h", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut decoded = decoded;
+    decoded.stdin.as_mut().unwrap().write_all(&output)?;
+    let decoded_output = decoded.wait_with_output()?;
+    if !decoded_output.status.success() {
+        return Err("samtools view -h failed to decode BAM output".into());
+    }
+
+    let mut actual_n_records = 0;
+    for line in decoded_output.stdout.lines() {
+        if line.starts_with(b"@") {
+            continue;
+        }
+        actual_n_records += 1;
+    }
+
+    assert_eq!(actual_n_records, 8);
+
+    Ok(())
+}
+
+#[test]
 fn legacy_text_sidecar_is_rebuilt_as_binary() -> Result<(), Box<dyn std::error::Error>> {
     let tempdir = tempfile::tempdir()?;
     let input = tempdir.path().join("legacy.sam");
@@ -587,7 +657,7 @@ fn legacy_text_sidecar_is_rebuilt_as_binary() -> Result<(), Box<dyn std::error::
     cmd.args(["--show", input.to_str().unwrap()]).unwrap();
 
     let sidecar_bytes = fs::read(&sidecar_path)?;
-    assert!(sidecar_bytes.starts_with(b"ONTIDX2\0"));
+    assert!(sidecar_bytes.starts_with(b"ONTIDX4\0"));
 
     Ok(())
 }

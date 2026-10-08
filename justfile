@@ -11,3 +11,7 @@ test:
 # get coverage with tarpaulin
 coverage:
     cargo tarpaulin -t 300 -- --test-threads 1
+
+# benchmark first-run vs repeat-run BAM queries on synthetic inputs
+bench-repeat-bam:
+    ./scripts/benchmark_repeat_bam.sh

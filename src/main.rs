@@ -2,7 +2,8 @@ mod cli;
 mod io;
 
 use crate::cli::Cli;
-use crate::io::alignment_start_times_from_path;
+use crate::io::extract_bam_candidate_spans_into;
+use crate::io::alignment_time_index_from_path;
 use crate::io::Fastx;
 use crate::io::TimeExt;
 use anyhow::{anyhow, Context, Result};
@@ -304,11 +305,18 @@ fn main() -> Result<()> {
 
     info!("Extracting read start times...");
 
-    let start_times = match input_format {
-        FileFormat::Fastx => input_fastx.start_times(),
-        FileFormat::Alignment => alignment_start_times_from_path(&args.input),
-    }
-    .context("Failed to extract start times")?;
+    let alignment_index = match input_format {
+        FileFormat::Alignment => Some(
+            alignment_time_index_from_path(&args.input).context("Failed to extract start times")?,
+        ),
+        FileFormat::Fastx => None,
+    };
+    let start_times = match &alignment_index {
+        Some(index) => index.start_times().to_vec(),
+        None => input_fastx
+            .start_times()
+            .context("Failed to extract start times")?,
+    };
 
     if start_times.is_empty() {
         return Err(anyhow!("Did not find any start times in the input"));
@@ -317,10 +325,15 @@ fn main() -> Result<()> {
     info!("Gathered start times for {} reads", start_times.len());
 
     // safe to unwrap as we know start times is not empty
-    let (first_timestamp, last_timestamp) = match start_times.iter().minmax() {
-        NoElements => return Err(anyhow!("No start times in input fastq")),
-        OneElement(el) => (*el, *el),
-        MinMax(x, y) => (*x, *y),
+    let (first_timestamp, last_timestamp) = match &alignment_index {
+        Some(index) => index
+            .first_last()
+            .ok_or_else(|| anyhow!("No start times in input alignment"))?,
+        None => match start_times.iter().minmax() {
+            NoElements => return Err(anyhow!("No start times in input fastq")),
+            OneElement(el) => (*el, *el),
+            MinMax(x, y) => (*x, *y),
+        },
     };
 
     if args.show {
@@ -382,7 +395,18 @@ fn main() -> Result<()> {
         "Extracting reads with a start time between {} and {}...",
         earliest, latest
     );
-    let reads_to_keep = valid_selection(&start_times, &earliest, &latest);
+    let reads_to_keep = match &alignment_index {
+        Some(index) => index.valid_selection(&earliest, &latest),
+        None => valid_selection(&start_times, &earliest, &latest),
+    };
+    let bam_candidate_spans = alignment_index.as_ref().and_then(|index| {
+        if !matches!(args.input.extension().and_then(|ext| ext.to_str()), Some("bam")) {
+            return None;
+        }
+
+        let spans = index.bam_candidate_spans(&earliest, &latest);
+        (!spans.is_empty()).then_some(spans)
+    });
     let nb_reads_to_keep = reads_to_keep.keep_count();
 
     match output_type {
@@ -410,12 +434,27 @@ fn main() -> Result<()> {
         FileFormat::Alignment => {
             let mut writer = build_alignment_writer(&args.input, args.output.as_deref())?;
 
-            let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
-                .build_from_path(&args.input)?;
-            bam_reader.extract_reads_in_timeframe_into(
-                &reads_to_keep,
-                &mut writer,
-            )?;
+            if let Some(candidate_spans) = &bam_candidate_spans {
+                let nb_reads_written = extract_bam_candidate_spans_into(
+                    &args.input,
+                    candidate_spans,
+                    &earliest,
+                    &latest,
+                    &mut writer,
+                )?;
+                if nb_reads_written != nb_reads_to_keep {
+                    return Err(anyhow!(
+                        "BAM span-limited extraction wrote {nb_reads_written} reads, expected {nb_reads_to_keep}"
+                    ));
+                }
+            } else {
+                let mut bam_reader = noodles_util::alignment::io::reader::Builder::default()
+                    .build_from_path(&args.input)?;
+                bam_reader.extract_reads_in_timeframe_into(
+                    &reads_to_keep,
+                    &mut writer,
+                )?;
+            }
         }
     };
 

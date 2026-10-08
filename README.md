@@ -218,6 +218,28 @@ hour. Likewise, passing `--to 2h` says "I only want reads that were generated be
 second hour of sequencing". Using `--from` and `--to` in combination gives you a range.
 
 We support a range of time/duration units and they can be combined. For example,
+
+## Performance Benchmarks
+
+A repeatable synthetic BAM benchmark is available for first-run vs repeat-run timing:
+
+```shell
+just bench-repeat-bam
+```
+
+Prerequisites:
+- `samtools`
+- `python3`
+
+This benchmark generates two synthetic BAMs:
+- `clustered`: nearby records have localized timestamps, which is where the sidecar span pruning and BAM virtual-offset seeking should help most
+- `mixed`: nearby records contain a wide timestamp range, which is a counterexample where pruning has less effect
+
+You can scale the generated data with environment variables:
+
+```shell
+RECORD_GROUPS=40 READS_PER_GROUP=2000 just bench-repeat-bam
+```
 `3h45m` to indicate 3 hours and 45 minutes. See the [`duration-str` docs][duration] for
 the full list
 of support duration units.
